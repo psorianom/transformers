@@ -30,6 +30,8 @@ from logging import StreamHandler
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
+from tqdm.auto import tqdm
+
 
 # Integrations must be imported before ML frameworks:
 from .integrations import (  # isort: split
@@ -56,9 +58,12 @@ from torch.utils.data.sampler import RandomSampler, SequentialSampler
 
 from huggingface_hub import ModelHubMixin
 
+from . import __version__
+from .configuration_utils import PretrainedConfig
 from .data.data_collator import DataCollator, DataCollatorWithPadding, default_data_collator
 from .dependency_versions_check import dep_version_check
 from .file_utils import (
+    CONFIG_NAME,
     WEIGHTS_NAME,
     is_apex_available,
     is_datasets_available,
@@ -1000,14 +1005,23 @@ class Trainer:
 
             logger.info(f"Loading model from {resume_from_checkpoint}).")
 
+            if os.path.isfile(os.path.join(resume_from_checkpoint, CONFIG_NAME)):
+                config = PretrainedConfig.from_json_file(os.path.join(resume_from_checkpoint, CONFIG_NAME))
+                checkpoint_version = config.transformers_version
+                if checkpoint_version is not None and checkpoint_version != __version__:
+                    logger.warn(
+                        f"You are resuming training from a checkpoint trained with {checkpoint_version} of "
+                        f"Transformers but your current version is {__version__}. This is not recommended and could "
+                        "yield to errors or unwanted behaviors."
+                    )
+
             if self.deepspeed:
                 # will be resumed in deepspeed_init
                 pass
-            elif isinstance(self.model, PreTrainedModel):
-                self.model = self.model.from_pretrained(resume_from_checkpoint)
-                model_reloaded = True
             else:
-                state_dict = torch.load(os.path.join(resume_from_checkpoint, WEIGHTS_NAME))
+                # We load the model state dict on the CPU to avoid an OOM error.
+                state_dict = torch.load(os.path.join(resume_from_checkpoint, WEIGHTS_NAME), map_location="cpu")
+                # If the model is on the GPU, it still works!
                 self.model.load_state_dict(state_dict)
 
         # If model was re-initialized, put it on the right device and update self.model_wrapped
@@ -1100,6 +1114,7 @@ class Trainer:
         start_time = time.time()
         epochs_trained = 0
         steps_trained_in_current_epoch = 0
+        steps_trained_progress_bar = None
 
         # Check if continuing training from a checkpoint
         if resume_from_checkpoint is not None and os.path.isfile(
@@ -1119,8 +1134,12 @@ class Trainer:
             if not args.ignore_data_skip:
                 logger.info(
                     f"  Will skip the first {epochs_trained} epochs then the first {steps_trained_in_current_epoch} "
-                    "batches in the first epoch."
+                    "batches in the first epoch. If this takes a lot of time, you can add the `--ignore_data_skip` "
+                    "flag to your launch command, but you will resume the training on data already seen by your model."
                 )
+                if self.is_local_process_zero() and not args.disable_tqdm:
+                    steps_trained_progress_bar = tqdm(total=steps_trained_in_current_epoch)
+                    steps_trained_progress_bar.set_description("Skipping the first batches")
 
         # Update the references
         self.callback_handler.model = self.model
@@ -1179,7 +1198,12 @@ class Trainer:
                 # Skip past any already trained steps if resuming training
                 if steps_trained_in_current_epoch > 0:
                     steps_trained_in_current_epoch -= 1
+                    if steps_trained_progress_bar is not None:
+                        steps_trained_progress_bar.update(1)
                     continue
+                elif steps_trained_progress_bar is not None:
+                    steps_trained_progress_bar.close()
+                    steps_trained_progress_bar = None
 
                 if step % args.gradient_accumulation_steps == 0:
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
@@ -1284,13 +1308,10 @@ class Trainer:
             logger.info(
                 f"Loading best model from {self.state.best_model_checkpoint} (score: {self.state.best_metric})."
             )
-            if isinstance(self.model, PreTrainedModel):
-                self.model = self.model.from_pretrained(self.state.best_model_checkpoint)
-                if self.place_model_on_device:
-                    self.model = self.model.to(args.device)
-            else:
-                state_dict = torch.load(os.path.join(self.state.best_model_checkpoint, WEIGHTS_NAME))
-                self.model.load_state_dict(state_dict)
+            # We load the model state dict on the CPU to avoid an OOM error.
+            state_dict = torch.load(os.path.join(self.state.best_model_checkpoint, WEIGHTS_NAME), map_location="cpu")
+            # If the model is on the GPU, it still works!
+            self.model.load_state_dict(state_dict)
 
             if self.deepspeed:
                 self.deepspeed.load_checkpoint(
