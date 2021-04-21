@@ -342,6 +342,13 @@ class QuestionAnsweringPipeline(Pipeline):
                 start_[0] = end_[0] = 0.0
 
                 starts, ends, scores = self.decode(start_, end_, kwargs["topk"], kwargs["max_answer_len"])
+                
+                # Filter out indices that are not in the context
+                desired_spans = np.in1d(starts, undesired_tokens.nonzero()) & np.in1d(ends, undesired_tokens.nonzero())
+                starts = starts[desired_spans]
+                ends = ends[desired_spans]
+                scores = scores[desired_spans]
+
                 if not self.tokenizer.is_fast:
                     char_to_word = np.array(example.char_to_word_offset)
 
